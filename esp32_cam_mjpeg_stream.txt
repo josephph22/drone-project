@@ -1,0 +1,188 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <esp_http_server.h>
+
+// --- Configuration for Access Point Mode ---
+const char* ap_ssid = "MarshaDrone_AP";       // SSID for the Drone's Wi-Fi Network
+const char* ap_password = "MarsMission123";   // Password for the Drone's Wi-Fi (min 8 chars)
+
+// Define the static IP address, gateway, and subnet mask for the AP
+IPAddress local_IP(192, 168, 1, 46); // The fixed IP address for the ESP32-CAM
+IPAddress gateway(192, 168, 1, 46);  // Gateway IP (can be same as local_IP for simple AP)
+IPAddress subnet(255, 255, 255, 0);  // Subnet mask
+
+// Camera config (AI Thinker) - Pinout remains the same
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+void startCameraServer();  // forward declaration
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  delay(1000);
+  Serial.println("\n📷 ESP32-CAM Booting for Performance...");
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  // --- Performance & Quality Adjustments ---
+  config.frame_size = FRAMESIZE_VGA;   // 640x480: Smaller frame for faster processing & transmission
+                                       // Other options: FRAMESIZE_CIF (400x296), FRAMESIZE_QVGA (320x240) for even higher FPS
+                                       // or FRAMESIZE_SVGA (800x600) if more detail is needed with slight perf cost.
+  config.jpeg_quality = 25;            // 0-63: Higher value = lower quality, smaller size.
+                                       // Increase for more FPS, decrease for better image. 20-30 is a common range.
+  config.fb_count = 1;                 // Using 1 frame buffer can save RAM and sometimes be faster/more stable.
+                                       // If issues arise, try 2.
+  // --- End Performance & Quality Adjustments ---
+
+
+  Serial.println("🔌 Initializing camera...");
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("❌ Camera init failed with error 0x%x\n", err);
+    Serial.println("Check wiring, power, and camera model. Consider reducing frame_size or increasing fb_count if it's an allocation issue.");
+    while (true);
+  }
+  Serial.println("✅ Camera initialized.");
+
+  // --- Setup Wi-Fi Access Point ---
+  Serial.println("📡 Configuring Access Point...");
+  if (!WiFi.softAPConfig(local_IP, gateway, subnet)) {
+    Serial.println("❌ Failed to configure AP static IP!");
+    while(true);
+  }
+
+  if (!WiFi.softAP(ap_ssid, ap_password)) {
+    Serial.println("❌ Failed to start AP!");
+    while(true);
+  }
+
+  Serial.println("\n✅ Wi-Fi Access Point Started!");
+  Serial.print(" SSID: ");
+  Serial.println(ap_ssid);
+  // Serial.print(" Password: "); // Optional: Don't print password to serial for security
+  // Serial.println(ap_password);
+  Serial.print("📷 Stream URL: http://");
+  Serial.print(WiFi.softAPIP());
+  Serial.println("/stream");
+
+  startCameraServer();
+}
+
+void loop() {
+  delay(1000); // Keep main loop light, server and camera run in their own tasks
+}
+
+static esp_err_t stream_handler(httpd_req_t *req) {
+  camera_fb_t *fb = NULL;
+  esp_err_t res = ESP_OK;
+  char buf[128]; // Buffer for HTTP headers
+
+  res = httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
+  if (res != ESP_OK) return res;
+  // Set custom headers for better client handling if needed
+  // httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, pre-check=0, post-check=0, max-age=0");
+  // httpd_resp_set_hdr(req, "Pragma", "no-cache");
+  // httpd_resp_set_hdr(req, "Connection", "close"); // May impact performance for multiple rapid requests, but good for single stream
+
+
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("❌ Frame capture failed");
+      // A small delay might help if this happens frequently due to resource contention
+      // vTaskDelay(pdMS_TO_TICKS(100)); 
+      // continue; // Or return ESP_FAIL to terminate
+      return ESP_FAIL;
+    }
+
+    if (fb->format != PIXFORMAT_JPEG) {
+        Serial.println("❌ Non-JPEG frame captured!");
+        esp_camera_fb_return(fb);
+        // Potentially reconfigure or log error more significantly
+        return ESP_FAIL; 
+    }
+
+    size_t hlen = snprintf(buf, sizeof(buf),
+      "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+    
+    esp_err_t send_res = httpd_resp_send_chunk(req, buf, hlen);
+    if (send_res == ESP_OK) {
+        send_res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
+    }
+    if (send_res == ESP_OK) {
+        send_res = httpd_resp_send_chunk(req, "\r\n", 2);
+    }
+
+    esp_camera_fb_return(fb); // Crucial: return frame buffer quickly
+
+    if (send_res != ESP_OK) {
+      // Serial.printf("⚠️ Stream send error: 0x%x. Client might have disconnected.\n", send_res);
+      // This error is common if the client (Python script) closes the connection (e.g., user presses 'q')
+      // So, we break the loop to gracefully end this handler instance.
+      break; 
+    }
+  }
+  // Serial.printf("Stream handler finished. Free heap: %u bytes\n", ESP.getFreeHeap());
+  return res;
+}
+
+void startCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  config.ctrl_port = 32768; // Default control port
+  config.stack_size = 6144; // Increased stack size for httpd task if handling larger frames or more logic
+  config.max_uri_handlers = 8; // Default 8, if more URI needed, increase
+  config.recv_wait_timeout = 5; // Seconds
+  config.send_wait_timeout = 5; // Seconds
+  // config.task_priority = tskIDLE_PRIORITY + 5; // Adjust priority if needed
+
+  httpd_uri_t stream_uri = {
+    .uri      = "/stream",
+    .method   = HTTP_GET,
+    .handler  = stream_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_handle_t server = NULL;
+  if (httpd_start(&server, &config) == ESP_OK) {
+    httpd_register_uri_handler(server, &stream_uri);
+    Serial.println("🌐 MJPEG stream server started on port 80.");
+  } else {
+    Serial.println("❌ Failed to start web server.");
+  }
+}

@@ -1,0 +1,170 @@
+import cv2
+import requests
+import numpy as np
+from ultralytics import YOLO
+import time
+
+# === CONFIG ===
+STREAM_URL = "http://192.168.1.46/stream"  # ESP32-CAM IP (should match AP IP)
+MODEL_PATH = "yolov8n.pt" # Using a nano model for speed
+TARGET_CLASSES = ["person", "car", "bottle"] # Example classes
+ALERT_AREA_THRESHOLD = 20000 # Adjust based on IMG_SIZE and desired proximity sensitivity
+                             # Lower this if IMG_SIZE is smaller or if ESP32 sends smaller frames directly
+
+# --- Performance Related Configs ---
+# RUN_EVERY_N_FRAMES: Process every Nth frame for detection. Higher N = better UI FPS, less detection frequency.
+# 1 = detect every frame (most demanding). 5 is a good balance.
+RUN_EVERY_N_FRAMES = 5 
+# IMG_SIZE: YOLO model input size. Smaller = faster. 224 is already quite small and fast.
+# Larger sizes (e.g., 320, 480, 640) might improve detection accuracy for small objects
+# but will significantly decrease YOLO processing speed.
+IMG_SIZE = 224
+# CONF_THRESHOLD: Confidence threshold for YOLO detections. Does not directly impact FPS much,
+# but affects how many detections are processed and drawn.
+CONF_THRESHOLD = 0.4
+# ---
+
+# === LOAD YOLOv8 MODEL ON GPU ===
+print("🧠 Loading YOLOv8 model...")
+try:
+    model = YOLO(MODEL_PATH)
+    # model.to('cuda') # model.predict already handles device="cuda"
+except Exception as e:
+    print(f"❌ Error loading YOLO model: {e}")
+    print("Ensure PyTorch with CUDA support is installed correctly if using GPU.")
+    exit()
+
+# === CONNECT TO MJPEG STREAM ===
+def connect_stream(url):
+    print(f"🔌 Connecting to stream: {url}")
+    for attempt in range(5): # Retry connection a few times
+        try:
+            # Set timeouts: (connect_timeout, read_timeout)
+            # Lower read_timeout can make it more responsive to disconnects but might cut off slow frames.
+            stream = requests.get(url, stream=True, timeout=(5, 15)) 
+            stream.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
+            if stream.status_code == 200:
+                print("✅ Connected to ESP32-CAM stream.")
+                return stream
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Attempt {attempt+1}/5 failed to connect: {e}")
+        except Exception as e:
+            print(f"❌ Attempt {attempt+1}/5 an unexpected error occurred: {e}")
+        time.sleep(2) # Wait before retrying
+    return None
+
+# === MAIN STREAM LOOP ===
+def stream_loop():
+    stream = connect_stream(STREAM_URL)
+    if not stream:
+        print("🛑 Could not connect to stream after multiple attempts. Exiting.")
+        return
+
+    buffer = b""
+    frame_count = 0
+    fps_counter = 0
+    start_time = time.time()
+    last_detection_time = time.time()
+
+    try:
+        for chunk in stream.iter_content(chunk_size=4096): # Increased chunk_size for potentially better network efficiency
+            buffer += chunk
+            a = buffer.find(b'\xff\xd8') # JPEG start
+            b = buffer.find(b'\xff\xd9') # JPEG end
+            
+            if a != -1 and b != -1 and b > a:
+                jpg = buffer[a:b+2]
+                buffer = buffer[b+2:]
+
+                try:
+                    img_array = np.frombuffer(jpg, dtype=np.uint8)
+                    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                    
+                    if frame is None:
+                        print("⚠️ Decoded frame is None. Skipping.")
+                        continue
+                    
+                    original_height, original_width = frame.shape[:2]
+                    # No explicit resize here if ESP32 sends VGA and IMG_SIZE is smaller;
+                    # YOLO's predict will handle resizing to IMG_SIZE.
+                    # If you wanted to display the original aspect ratio and then process,
+                    # you'd do more complex handling.
+
+                    detections_on_frame = [] # Store detections for the current frame
+                    
+                    # Run detection only every N frames for performance
+                    if frame_count % RUN_EVERY_N_FRAMES == 0:
+                        # Perform inference
+                        results = model.predict(source=frame, device="cuda", imgsz=IMG_SIZE, conf=CONF_THRESHOLD, verbose=False)[0]
+                        detections_on_frame = results.boxes 
+                        # You could store these detections if needed for frames where YOLO isn't run
+                        # last_detections = detections_on_frame 
+
+                    # Draw detections (either current or last known if you implement persistence)
+                    for box in detections_on_frame: # Or use 'last_detections' if you want to show old boxes
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        cls = int(box.cls[0])
+                        conf = float(box.conf[0])
+                        label = model.names[cls]
+
+                        area = (x2 - x1) * (y2 - y1) # Area calculated on the (potentially resized by YOLO) detection coordinates
+                                                     # If you need area from original frame, map coordinates back.
+                        is_close = area > ALERT_AREA_THRESHOLD 
+                        color = (0, 0, 255) if is_close else (0, 255, 0) # Red if close, Green otherwise
+
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                        if label in TARGET_CLASSES and is_close:
+                            print(f"🛑 CLOSE ALERT: {label} (Confidence: {conf:.2f}) Area: {area}")
+                    
+                    # Display the frame
+                    cv2.imshow("YOLOv8 - Marsha Drone ESP32-CAM", frame)
+                    frame_count += 1
+                    fps_counter += 1
+
+                    # Calculate and display FPS (based on displayed frames)
+                    current_time = time.time()
+                    if current_time - start_time >= 1.0:
+                        print(f"📈 Display FPS: {fps_counter} (YOLO run every {RUN_EVERY_N_FRAMES} frames)")
+                        fps_counter = 0
+                        start_time = current_time
+
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        print("🛑 Exit key pressed.")
+                        break
+                
+                except cv2.error as e:
+                    print(f"❌ OpenCV Error (likely decoding issue): {e}. Skipping frame.")
+                    buffer = b"" # Clear buffer to try and resync
+                except Exception as e:
+                    print(f"❌ Frame processing error: {e}")
+
+    except requests.exceptions.ChunkedEncodingError as e:
+        print(f"⚠️ Stream connection lost or interrupted (ChunkedEncodingError): {e}")
+    except Exception as e:
+        print(f"⚠️ Main stream loop exception: {e}")
+    finally:
+        print("🚪 Closing stream and cleaning up...")
+        if stream:
+            stream.close()
+        cv2.destroyAllWindows()
+        print("🔁 Attempting to reconnect in 5 seconds...\n")
+        time.sleep(5)
+        stream_loop() # Recursive call to reconnect
+
+# === RUN ===
+if __name__ == "__main__":
+    # Optional: Check CUDA availability
+    try:
+        import torch
+        if torch.cuda.is_available():
+            print(f"✅ CUDA is available! PyTorch version: {torch.__version__}, CUDA version: {torch.version.cuda}")
+            print(f"   Using GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            print("⚠️ CUDA not available, YOLO will run on CPU (slower).")
+    except ImportError:
+        print("Torch not installed, YOLO might use a different backend or CPU.")
+    
+    stream_loop()

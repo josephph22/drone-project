@@ -1,0 +1,127 @@
+#include <Servo.h>
+#include <Wire.h>
+#include <MPU6050.h>
+
+// Global Variables
+MPU6050 mpu;
+
+float accelOffsetX = 0, accelOffsetY = 0, accelOffsetZ = 0;
+float gyroOffsetX = 0, gyroOffsetY = 0, gyroOffsetZ = 0;
+
+float pitch = 0, roll = 0;
+
+Servo motorFL, motorFR, motorBL, motorBR;
+
+const int BASE_THROTTLE = 1400;
+const int MIN_THROTTLE = 1000, MAX_THROTTLE = 2000;
+
+const float GYRO_WEIGHT = 0.98;
+const float ACCEL_WEIGHT = 0.02;
+
+const float PITCH_CORRECTION = 5.0;
+const float ROLL_CORRECTION = 5.0;
+
+unsigned long previousTime = 0;
+
+// Setup Section
+void setup() {
+    Wire.begin();
+    mpu.initialize();
+
+    attachMotors();
+    calibrateMPU6050();
+    initializeMotors();
+}
+
+// Motor Attachment
+void attachMotors() {
+    motorFL.attach(5);
+    motorFR.attach(9);
+    motorBL.attach(10);
+    motorBR.attach(11);
+}
+
+// MPU6050 Calibration
+void calibrateMPU6050() {
+    const int NUM_SAMPLES = 500;
+
+    long accelSumX = 0, accelSumY = 0, accelSumZ = 0;
+    long gyroSumX = 0, gyroSumY = 0, gyroSumZ = 0;
+
+    for (int i = 0; i < NUM_SAMPLES; i++) {
+        int16_t ax, ay, az, gx, gy, gz;
+        mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+        accelSumX += ax;
+        accelSumY += ay;
+        accelSumZ += az;
+        gyroSumX += gx;
+        gyroSumY += gy;
+        gyroSumZ += gz;
+
+        delay(2);
+    }
+
+    accelOffsetX = accelSumX / NUM_SAMPLES;
+    accelOffsetY = accelSumY / NUM_SAMPLES;
+    accelOffsetZ = accelSumZ / NUM_SAMPLES;
+
+    gyroOffsetX = gyroSumX / NUM_SAMPLES;
+    gyroOffsetY = gyroSumY / NUM_SAMPLES;
+    gyroOffsetZ = gyroSumZ / NUM_SAMPLES;
+}
+
+// Motor Initialization
+void initializeMotors() {
+    motorFL.writeMicroseconds(BASE_THROTTLE);
+    motorFR.writeMicroseconds(BASE_THROTTLE);
+    motorBL.writeMicroseconds(BASE_THROTTLE);
+    motorBR.writeMicroseconds(BASE_THROTTLE);
+}
+
+// Main Loop
+void loop() {
+    float deltaTime = calculateElapsedTime();
+    updateAngles(deltaTime);
+    adjustMotorSpeeds();
+}
+
+// Timing Calculation
+float calculateElapsedTime() {
+    unsigned long currentTime = millis();
+    float deltaTime = (currentTime - previousTime) / 1000.0;
+    previousTime = currentTime;
+    return deltaTime;
+}
+
+// Angle Calculation
+void updateAngles(float deltaTime) {
+    int16_t ax, ay, az, gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    float accelX = (ax - accelOffsetX) / 16384.0;
+    float accelY = (ay - accelOffsetY) / 16384.0;
+    float accelZ = (az - accelOffsetZ) / 16384.0;
+
+    float gyroX = (gx - gyroOffsetX) / 131.0;
+    float gyroY = (gy - gyroOffsetY) / 131.0;
+
+    float accelPitch = atan2(accelY, sqrt(accelX * accelX + accelZ * accelZ)) * 180 / PI;
+    float accelRoll = atan2(-accelX, sqrt(accelY * accelY + accelZ * accelZ)) * 180 / PI;
+
+    pitch = GYRO_WEIGHT * (pitch + gyroX * deltaTime) + ACCEL_WEIGHT * accelPitch;
+    roll = GYRO_WEIGHT * (roll + gyroY * deltaTime) + ACCEL_WEIGHT * accelRoll;
+}
+
+// Corrected Motor Speed Adjustment
+void adjustMotorSpeeds() {
+    int throttleFL = BASE_THROTTLE + (int)(pitch * PITCH_CORRECTION) + (int)(roll * ROLL_CORRECTION);
+    int throttleFR = BASE_THROTTLE + (int)(pitch * PITCH_CORRECTION) - (int)(roll * ROLL_CORRECTION);
+    int throttleBL = BASE_THROTTLE - (int)(pitch * PITCH_CORRECTION) + (int)(roll * ROLL_CORRECTION);
+    int throttleBR = BASE_THROTTLE - (int)(pitch * PITCH_CORRECTION) - (int)(roll * ROLL_CORRECTION);
+
+    motorFL.writeMicroseconds(constrain(throttleFL, MIN_THROTTLE, MAX_THROTTLE));
+    motorFR.writeMicroseconds(constrain(throttleFR, MIN_THROTTLE, MAX_THROTTLE));
+    motorBL.writeMicroseconds(constrain(throttleBL, MIN_THROTTLE, MAX_THROTTLE));
+    motorBR.writeMicroseconds(constrain(throttleBR, MIN_THROTTLE, MAX_THROTTLE));
+}

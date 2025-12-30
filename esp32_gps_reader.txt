@@ -1,0 +1,62 @@
+#include <TinyGPS++.h>
+
+TinyGPSPlus gps;
+HardwareSerial GPSserial(1);  // UART1
+
+#define GPS_RX 16  // GPS TX → ESP32 RX
+#define GPS_TX 17  // Not used, but needed by API
+
+void setup() {
+  Serial.begin(115200);
+  GPSserial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println("GPS Initialized. Waiting for fix...");
+}
+
+void loop() {
+  while (GPSserial.available()) {
+    gps.encode(GPSserial.read());
+  }
+
+  if (gps.location.isValid()) {
+    float lat = gps.location.lat();
+    float lon = gps.location.lng();
+    float alt = gps.altitude.meters();
+
+    String message = "";
+    message += "\n--- GPS DATA ---\n";
+    message += "Latitude: " + String(lat, 6) + "\n";
+    message += "Longitude: " + String(lon, 6) + "\n";
+    message += "Altitude (m): " + String(alt, 1) + "\n";
+    message += "Satellites: " + String(gps.satellites.value()) + "\n";
+    message += "Google Maps: https://www.google.com/maps?q=" + String(lat, 6) + "," + String(lon, 6) + "\n";
+
+    if (gps.date.isValid()) {
+      message += "Date: ";
+      message += String(gps.date.day()) + "/";
+      message += String(gps.date.month()) + "/";
+      message += String(gps.date.year()) + "\n";
+    }
+
+    if (gps.time.isValid()) {
+      int hour = gps.time.hour() + 3;  // Convert UTC → UTC+3 (Istanbul)
+      if (hour >= 24) hour -= 24;
+
+      message += "Time (Istanbul): ";
+      if (hour < 10) message += "0";
+      message += String(hour) + ":";
+
+      if (gps.time.minute() < 10) message += "0";
+      message += String(gps.time.minute()) + ":";
+
+      if (gps.time.second() < 10) message += "0";
+      message += String(gps.time.second()) + "\n";
+    }
+
+    message += "-------------------------------\n";
+    Serial.println(message);
+    delay(1000);
+  } else {
+    Serial.println("Waiting for GPS fix...");
+    delay(1000);
+  }
+}
